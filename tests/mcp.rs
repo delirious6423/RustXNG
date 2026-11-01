@@ -174,6 +174,12 @@ async fn tools_are_listed_read_only_with_schemas() {
         assert!(tool.output_schema.is_some(), "{}", tool.name);
         let input = serde_json::to_value(&*tool.input_schema).unwrap();
         assert_eq!(input["additionalProperties"], json!(false), "{}", tool.name);
+        // No nullable types: strict tool-calling clients reject them.
+        assert!(
+            !input.to_string().contains("null"),
+            "{}: {input}",
+            tool.name
+        );
     }
     client.cancel().await.unwrap();
 }
