@@ -200,7 +200,10 @@ impl McpServer {
 }
 
 impl McpServer {
-    async fn run_search(&self, args: SearchArgs) -> Result<SearchOutput, String> {
+    /// Build the search request the way the web form does for a visitor
+    /// without cookies: the settings' defaults for locale, safe search,
+    /// strategy and plugins, then the tool arguments.
+    fn build_request(&self, args: SearchArgs) -> Result<(SearchRequest, usize), String> {
         if args.query.trim().is_empty() {
             return Err("query must not be empty".into());
         }
@@ -215,20 +218,47 @@ impl McpServer {
                     .ok_or("time_range must be \"day\", \"week\", \"month\" or \"year\"")?,
             ),
         };
-        let query = Query::parse(&args.query, &self.searcher.registry, &[]);
+        let settings = &self.searcher.settings;
+        let defaults = crate::web::preferences::Preferences::from_settings(settings);
+        let mut query = Query::parse(
+            &args.query,
+            &self.searcher.registry,
+            &defaults.disabled_engines,
+        );
+        // Engines read the language from the query's locale (e.g. Google's hl/lr).
+        let explicit_language = args.language.filter(|value| !value.is_empty());
+        if let Some(language) = &explicit_language {
+            query.locale = language.clone();
+        } else if query.locale.is_empty() {
+            query.locale = defaults.locale.clone();
+        }
+        query.safesearch = defaults.safesearch.min(2);
+        query.time_range = time_range;
+        let language = explicit_language.unwrap_or_else(|| {
+            if defaults.language.is_empty() {
+                query.engine_language()
+            } else {
+                defaults.language.clone()
+            }
+        });
         let mut request = SearchRequest::new(query);
         if !args.categories.is_empty() {
             request.categories = args.categories;
         }
         request.time_range = time_range;
-        request.query.time_range = time_range;
-        if let Some(language) = args.language.filter(|value| !value.is_empty()) {
-            request.language = language;
-        }
+        request.safesearch = defaults.safesearch.min(2);
+        request.language = language;
+        request.strategy = settings.search.strategy;
+        request.enabled_plugins = defaults.enabled_plugins;
+        request.disabled_plugins = defaults.disabled_plugins;
         request.include_domains = args.include_domains;
         request.exclude_domains = args.exclude_domains;
         request.max_results = Some(limit);
+        Ok((request, limit))
+    }
 
+    async fn run_search(&self, args: SearchArgs) -> Result<SearchOutput, String> {
+        let (request, limit) = self.build_request(args)?;
         let response = self.searcher.search(request).await;
         if let Some(error) = response.error {
             return Err(error);
@@ -349,6 +379,59 @@ fn slice_page_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server(settings: crate::settings::Settings) -> McpServer {
+        McpServer::new(Arc::new(Searcher::new(settings).unwrap()))
+    }
+
+    fn args(query: &str) -> SearchArgs {
+        SearchArgs {
+            query: query.into(),
+            limit: None,
+            categories: Vec::new(),
+            time_range: None,
+            language: None,
+            include_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+        }
+    }
+
+    /// The configured defaults reach the request and the engines' parameters.
+    #[test]
+    fn requests_use_the_configured_defaults_and_the_language_argument() {
+        let mut settings = crate::settings::Settings::defaults();
+        settings.engines = vec![crate::settings::EngineConfig::new(
+            "google",
+            "google",
+            "go",
+            &["general"],
+        )];
+        settings.search.safe_search = 2;
+        settings.search.default_lang = "de".into();
+        settings.search.strategy = crate::settings::SearchStrategy::Staged;
+        let server = server(settings);
+        let google = server.searcher.registry.get("google").unwrap().clone();
+
+        let (request, limit) = server.build_request(args("rust")).unwrap();
+        assert_eq!(limit, DEFAULT_LIMIT);
+        assert_eq!(request.safesearch, 2);
+        assert_eq!(request.query.safesearch, 2);
+        assert_eq!(request.language, "de");
+        assert_eq!(request.strategy, crate::settings::SearchStrategy::Staged);
+        let url = google.build_request(&request.query, 1).unwrap().url;
+        assert!(url.contains("safe=active"), "{url}");
+
+        let mut japanese = args("rust");
+        japanese.language = Some("ja".into());
+        japanese.time_range = Some("week".into());
+        let (request, _) = server.build_request(japanese).unwrap();
+        assert_eq!(request.language, "ja");
+        assert_eq!(request.query.locale, "ja");
+        let url = google.build_request(&request.query, 1).unwrap().url;
+        assert!(url.contains("hl=ja"), "{url}");
+        assert!(url.contains("lr=lang_ja"), "{url}");
+        assert!(url.contains("qdr%3Aw") || url.contains("qdr:w"), "{url}");
+    }
 
     #[test]
     fn slices_follow_unicode_characters_and_report_the_next_offset() {
