@@ -1,0 +1,32 @@
+{
+  "date_local": "2026-11-02",
+  "timezone": "Asia/Taipei",
+  "baseline_commit": "fef998b69cc1882a9258a7f2cba59bf77793d729",
+  "source_sha256": {
+    "src/content.rs": "6100d534fb005664ea4cd37a306069bc07fa56d8895b370876de7c76d7d530cb",
+    "src/cache.rs": "fbbb145ebea48fbb1bca1a82139607bafaca07c4cdaa3095389ec594f4a300b0",
+    "src/aggregator.rs": "07510fa687b6d6c2b405909a23f06366cfda2757808602d99aa85f25071039cb",
+    "examples/content_benchmark.rs": "99e2e7173c9831bdb66a575f93621525b19cf54cf63bf62b065599818aecee11",
+    "examples/cached_search_benchmark.rs": "af9e892a9aa09aeb3cfd9935d84b97e0617c6f8ec89a3001b14f916e5e60072e",
+    "tools/run_cached_search_benchmark.py": "9d3a839556c96a2e3cd1ccef4d252bde8ac0b20f9e3fa3263aa896934ef6b0d4"
+  },
+  "system": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "timed_build": "cargo build --release --locked --no-default-features",
+  "architecture_flags": "default x86_64; no target-cpu=native overrides",
+  "cache_workload": "same 32MiB memory cache, TTL3600s, one configured engine, five raw pages, max8000characters",
+  "stretch_target_factor": 200,
+  "requested_target_factor": 100,
+  "excluded_run": "The first component attempt accidentally reused a baseline Cargo library in a shared target directory. Its 1.00x results were discarded. Baseline and candidate were rebuilt in isolated target directories, and an executable allocation bound verifies the bounded extractor.",
+  "validation": {
+    "unit_tests": 813,
+    "integration_tests": 17,
+    "test_failures": 0,
+    "clippy_all_targets_warnings_as_errors": "passed",
+    "independent_review": "passed",
+    "content_differential_checks": 576,
+    "markdownlint": "passed",
+    "patch_applies_to_clean_upstream": "passed",
+    "applied_source_bytes_match_tested_source": "passed"
+  },
+  "primary_metric": "Median paired speedup for warmed loopback HTTP requests; one configured engine, five cached pages, one caller."
+}

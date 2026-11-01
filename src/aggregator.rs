@@ -869,6 +869,11 @@ impl Searcher {
             tracing::debug!(url, "refusing to fetch a non-public page");
             return None;
         }
+        let max_chars = self.settings.search.raw_content_chars.max(1);
+        let cache_key = Cache::key("GET", url, "");
+        if let Some(text) = self.cache.page_text(&cache_key, max_chars) {
+            return text;
+        }
         let request = crate::engine::EngineRequest::get(url)
             .header("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8");
         let response = self
@@ -877,8 +882,7 @@ impl Searcher {
             .await
             .ok()?;
         let html = response.html().ok()?;
-        let text =
-            crate::content::main_text_limited(&html, self.settings.search.raw_content_chars.max(1));
+        let text = crate::content::main_text_limited(&html, max_chars);
         if text.is_empty() { None } else { Some(text) }
     }
 
@@ -1093,6 +1097,40 @@ mod orchestration_tests {
 
     fn query(text: &str, registry: &EngineRegistry) -> Query {
         Query::parse(text, registry, &[])
+    }
+
+    #[tokio::test]
+    async fn cached_page_text_cannot_bypass_the_public_url_guard() {
+        let searcher = searcher(vec![]);
+        for url in [
+            "http://127.0.0.1/private",
+            "http://[::1]/private",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            let key = Cache::key("GET", url, "");
+            searcher
+                .cache
+                .set(
+                    &key,
+                    crate::cache::CachedResponse {
+                        status: 200,
+                        final_url: url.to_string(),
+                        headers: Default::default(),
+                        body: Arc::new(b"<article>private content</article>".to_vec()),
+                    },
+                )
+                .await;
+            let limit = searcher.settings.search.raw_content_chars.max(1);
+            assert_eq!(
+                searcher.cache.page_text(&key, limit),
+                Some(Some("private content".into()))
+            );
+            let before = searcher.cache.stats();
+            assert_eq!(searcher.page_text(url).await, None);
+            let after = searcher.cache.stats();
+            assert_eq!(after.hit, before.hit);
+            assert_eq!(after.miss, before.miss);
+        }
     }
 
     #[test]

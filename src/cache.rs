@@ -32,13 +32,28 @@ struct Entry {
     stored: Instant,
     response: CachedResponse,
     size: usize,
+    derived_page_text: Option<DerivedPageText>,
 }
+
+/// A single rendering of this exact cached body. Keeping it on the raw entry
+/// gives it the same generation, lifetime, eviction and clearing behavior.
+struct DerivedPageText {
+    max_chars: usize,
+    text: Option<std::sync::Arc<str>>,
+    accounted_bytes: usize,
+}
+
+/// Larger outputs are still returned in full; they simply are not retained.
+const MAX_DERIVED_PAGE_TEXT_BYTES: usize = 64 * 1024;
+/// Conservative additional accounting for the derived slot and Arc metadata.
+const DERIVED_PAGE_TEXT_OVERHEAD: usize = 128;
 
 #[derive(Default)]
 struct Inner {
     entries: HashMap<String, Entry>,
     order: VecDeque<String>,
     bytes: usize,
+    derived_bytes: usize,
 }
 
 /// A TTL + LRU cache for engine responses.
@@ -102,6 +117,94 @@ impl ResponseCache {
         }
     }
 
+    /// Read page text from the same raw-response cache entry. The outer None
+    /// means the caller must use its normal fetch path; Some(None) is a cached
+    /// body with no readable text. A miss here deliberately does not increment
+    /// the miss counter: the following Network::fetch owns that lookup.
+    fn page_text(&self, key: &str, max_chars: usize) -> Option<Option<String>> {
+        let (body, stored) = {
+            let mut inner = self.lock();
+            let expired = inner
+                .entries
+                .get(key)
+                .map(|entry| entry.stored.elapsed() > self.ttl)
+                .unwrap_or(false);
+            if expired {
+                self.remove_locked(&mut inner, key);
+                return None;
+            }
+            let entry = inner.entries.get(key)?;
+            self.hit.fetch_add(1, Ordering::Relaxed);
+            if let Some(derived) = &entry.derived_page_text {
+                if derived.max_chars == max_chars {
+                    let text = derived.text.clone();
+                    drop(inner);
+                    return Some(text.as_deref().map(str::to_owned));
+                }
+            }
+            (std::sync::Arc::clone(&entry.response.body), entry.stored)
+        };
+
+        // Parsing can be expensive and must not hold the cache mutex. Decode
+        // exactly as EngineResponse::html does, borrowing valid UTF-8 bytes.
+        let html = scraper::Html::parse_document(&String::from_utf8_lossy(&body));
+        let text = crate::content::main_text_limited(&html, max_chars);
+        let text = if text.is_empty() { None } else { Some(text) };
+        self.store_page_text(key, &body, stored, max_chars, text.as_deref());
+        Some(text)
+    }
+
+    /// Admission is conditional on the raw body still being the generation
+    /// parsed above. It never extends the raw TTL or evicts another response.
+    fn store_page_text(
+        &self,
+        key: &str,
+        body: &std::sync::Arc<Vec<u8>>,
+        stored: Instant,
+        max_chars: usize,
+        text: Option<&str>,
+    ) -> bool {
+        let text_bytes = text.map_or(0, str::len);
+        if text_bytes > MAX_DERIVED_PAGE_TEXT_BYTES {
+            return false;
+        }
+        let accounted_bytes = text_bytes + DERIVED_PAGE_TEXT_OVERHEAD;
+        let mut inner = self.lock();
+        let Some(entry) = inner.entries.get(key) else {
+            return false;
+        };
+        if entry.stored != stored
+            || entry.stored.elapsed() > self.ttl
+            || !std::sync::Arc::ptr_eq(body, &entry.response.body)
+        {
+            return false;
+        }
+        let previous_bytes = entry
+            .derived_page_text
+            .as_ref()
+            .map_or(0, |derived| derived.accounted_bytes);
+        let Some(next_bytes) = inner
+            .bytes
+            .checked_sub(previous_bytes)
+            .and_then(|bytes| bytes.checked_add(accounted_bytes))
+        else {
+            return false;
+        };
+        if next_bytes > self.max_bytes {
+            return false;
+        }
+        let entry = inner.entries.get_mut(key).expect("entry checked above");
+        entry.size = entry.size - previous_bytes + accounted_bytes;
+        entry.derived_page_text = Some(DerivedPageText {
+            max_chars,
+            text: text.map(std::sync::Arc::from),
+            accounted_bytes,
+        });
+        inner.bytes = next_bytes;
+        inner.derived_bytes = inner.derived_bytes - previous_bytes + accounted_bytes;
+        true
+    }
+
     pub fn set(&self, key: &str, response: CachedResponse) {
         let size = response.body.len() + key.len() + 128;
         if size > self.max_bytes {
@@ -117,6 +220,7 @@ impl ResponseCache {
                 stored: Instant::now(),
                 response,
                 size,
+                derived_page_text: None,
             },
         );
         inner.order.push_back(key.to_string());
@@ -126,6 +230,9 @@ impl ResponseCache {
     fn remove_locked(&self, inner: &mut Inner, key: &str) {
         if let Some(entry) = inner.entries.remove(key) {
             inner.bytes = inner.bytes.saturating_sub(entry.size);
+            if let Some(derived) = entry.derived_page_text {
+                inner.derived_bytes -= derived.accounted_bytes;
+            }
             if let Some(position) = inner.order.iter().position(|candidate| candidate == key) {
                 inner.order.remove(position);
             }
@@ -133,12 +240,31 @@ impl ResponseCache {
     }
 
     fn evict_locked(&self, inner: &mut Inner) {
+        // Derived text is opportunistic. Give its space back before evicting
+        // raw responses, so memoization cannot reduce raw-body retention.
+        if inner.bytes > self.max_bytes && inner.derived_bytes > 0 {
+            for key in &inner.order {
+                if let Some(entry) = inner.entries.get_mut(key) {
+                    if let Some(derived) = entry.derived_page_text.take() {
+                        entry.size -= derived.accounted_bytes;
+                        inner.bytes -= derived.accounted_bytes;
+                        inner.derived_bytes -= derived.accounted_bytes;
+                    }
+                }
+                if inner.bytes <= self.max_bytes || inner.derived_bytes == 0 {
+                    break;
+                }
+            }
+        }
         while inner.bytes > self.max_bytes {
             let Some(key) = inner.order.pop_front() else {
                 break;
             };
             if let Some(entry) = inner.entries.remove(&key) {
                 inner.bytes = inner.bytes.saturating_sub(entry.size);
+                if let Some(derived) = entry.derived_page_text {
+                    inner.derived_bytes -= derived.accounted_bytes;
+                }
             }
         }
     }
@@ -149,6 +275,7 @@ impl ResponseCache {
         inner.entries.clear();
         inner.order.clear();
         inner.bytes = 0;
+        inner.derived_bytes = 0;
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -215,6 +342,212 @@ mod tests {
         cache.set("key", response(&"x".repeat(100)));
         assert!(cache.get("key").is_none());
     }
+
+    fn generation(cache: &ResponseCache, key: &str) -> (std::sync::Arc<Vec<u8>>, Instant) {
+        let inner = cache.lock();
+        let entry = inner.entries.get(key).expect("raw entry");
+        (std::sync::Arc::clone(&entry.response.body), entry.stored)
+    }
+
+    #[test]
+    fn derived_page_text_reuses_one_slot_and_counts_one_hit() {
+        let cache = ResponseCache::default();
+        cache.set("page", response("<article>Hello   world</article>"));
+        let before = cache.stats().bytes;
+        let (_, stored) = generation(&cache, "page");
+        assert_eq!(
+            cache.page_text("page", 8000),
+            Some(Some("Hello world".into()))
+        );
+        let first = cache.lock().entries["page"]
+            .derived_page_text
+            .as_ref()
+            .unwrap()
+            .text
+            .clone()
+            .unwrap();
+        assert_eq!(
+            cache.page_text("page", 8000),
+            Some(Some("Hello world".into()))
+        );
+        let inner = cache.lock();
+        let entry = &inner.entries["page"];
+        let second = entry
+            .derived_page_text
+            .as_ref()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, second));
+        assert_eq!(entry.stored, stored, "derivation must not refresh the TTL");
+        drop(inner);
+        assert_eq!(cache.stats().hit, 2);
+        assert_eq!(cache.stats().miss, 0);
+        assert_eq!(
+            cache.stats().bytes,
+            before + 11 + DERIVED_PAGE_TEXT_OVERHEAD
+        );
+    }
+
+    #[test]
+    fn derived_missing_and_empty_are_distinct_without_double_counting_misses() {
+        let cache = ResponseCache::default();
+        assert_eq!(cache.page_text("missing", 8000), None);
+        assert_eq!(cache.stats().miss, 0);
+        assert!(cache.get("missing").is_none());
+        assert_eq!(cache.stats().miss, 1);
+        cache.set("empty", response("<article> \t\n </article>"));
+        assert_eq!(cache.page_text("empty", 8000), Some(None));
+        assert_eq!(cache.page_text("empty", 8000), Some(None));
+        assert!(cache.lock().entries["empty"].derived_page_text.is_some());
+        assert_eq!(cache.stats().hit, 2);
+        assert_eq!(cache.stats().miss, 1);
+    }
+
+    #[test]
+    fn different_limits_replace_the_single_derived_variant_and_its_accounting() {
+        let cache = ResponseCache::default();
+        cache.set("page", response("<article>你好 🦀 café</article>"));
+        let before = cache.stats().bytes;
+        for (limit, expected) in [
+            (2, "你好…"),
+            (4, "你好 🦀…"),
+            (0, "…"),
+            (40, "你好 🦀 café"),
+        ] {
+            assert_eq!(cache.page_text("page", limit), Some(Some(expected.into())));
+            assert_eq!(
+                cache.stats().bytes,
+                before + expected.len() + DERIVED_PAGE_TEXT_OVERHEAD
+            );
+            assert_eq!(
+                cache.lock().entries["page"]
+                    .derived_page_text
+                    .as_ref()
+                    .unwrap()
+                    .max_chars,
+                limit
+            );
+        }
+    }
+
+    #[test]
+    fn derived_text_uses_the_raw_ttl_and_does_not_cache_after_expiration() {
+        let cache = ResponseCache::new(Duration::from_secs(60), 8192);
+        cache.set("page", response("<article>old</article>"));
+        cache.lock().entries.get_mut("page").unwrap().stored =
+            Instant::now() - Duration::from_secs(30);
+        let (body, stored) = generation(&cache, "page");
+        assert_eq!(cache.page_text("page", 20), Some(Some("old".into())));
+        assert_eq!(generation(&cache, "page").1, stored);
+        let expired = Instant::now() - Duration::from_secs(61);
+        cache.lock().entries.get_mut("page").unwrap().stored = expired;
+        assert!(!cache.store_page_text("page", &body, expired, 20, Some("late")));
+        assert_eq!(cache.page_text("page", 20), None);
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(cache.stats().bytes, 0);
+        assert_eq!(cache.stats().miss, 0);
+    }
+
+    #[test]
+    fn replacement_and_clear_discard_derived_text_and_reject_in_flight_writes() {
+        let cache = ResponseCache::default();
+        cache.set("page", response("<article>old</article>"));
+        let (old_body, old_stored) = generation(&cache, "page");
+        assert_eq!(cache.page_text("page", 20), Some(Some("old".into())));
+        cache.set("page", response("<article>new</article>"));
+        assert!(!cache.store_page_text("page", &old_body, old_stored, 20, Some("old")));
+        assert!(cache.lock().entries["page"].derived_page_text.is_none());
+        assert_eq!(cache.page_text("page", 20), Some(Some("new".into())));
+        let (body, stored) = generation(&cache, "page");
+        cache.clear();
+        assert!(!cache.store_page_text("page", &body, stored, 20, Some("late")));
+        assert_eq!(cache.page_text("page", 20), None);
+        assert_eq!(cache.stats().bytes, 0);
+        assert_eq!(cache.lock().derived_bytes, 0);
+    }
+
+    #[test]
+    fn reusing_the_same_body_arc_still_creates_a_new_generation() {
+        let cache = ResponseCache::default();
+        let raw = response("<article>same bytes</article>");
+        cache.set("page", raw.clone());
+        cache.lock().entries.get_mut("page").unwrap().stored =
+            Instant::now() - Duration::from_secs(1);
+        let (body, stored) = generation(&cache, "page");
+        cache.set("page", raw);
+        assert!(std::sync::Arc::ptr_eq(&body, &generation(&cache, "page").0));
+        assert!(!cache.store_page_text("page", &body, stored, 20, Some("stale")));
+        assert_eq!(cache.page_text("page", 20), Some(Some("same bytes".into())));
+    }
+
+    #[test]
+    fn derived_admission_skips_a_full_cache_without_evicting_raw_entries() {
+        let raw = "<article>hello</article>";
+        let raw_size = raw.len() + 1 + 128;
+        let cache = ResponseCache::new(Duration::from_secs(60), 2 * raw_size);
+        cache.set("a", response(raw));
+        cache.set("b", response(raw));
+        assert_eq!(cache.page_text("a", 20), Some(Some("hello".into())));
+        assert!(cache.lock().entries["a"].derived_page_text.is_none());
+        assert_eq!(cache.stats().entries, 2);
+        assert_eq!(cache.stats().bytes, 2 * raw_size);
+    }
+
+    #[test]
+    fn oversized_unicode_derivations_are_returned_but_not_retained() {
+        let cache = ResponseCache::default();
+        let raw = format!("<article>{}</article>", "界".repeat(30_000));
+        cache.set("page", response(&raw));
+        let before = cache.stats().bytes;
+        let text = cache.page_text("page", 22_000).unwrap().unwrap();
+        assert_eq!(text.chars().count(), 22_001);
+        assert!(text.ends_with('…'));
+        assert!(text.len() > MAX_DERIVED_PAGE_TEXT_BYTES);
+        assert!(cache.lock().entries["page"].derived_page_text.is_none());
+        assert_eq!(cache.stats().bytes, before);
+    }
+
+    #[test]
+    fn raw_insertions_reclaim_derived_bytes_before_evicting_responses() {
+        let raw = "<article>hello</article>";
+        let raw_size = raw.len() + 1 + 128;
+        let cache = ResponseCache::new(Duration::from_secs(60), 3 * raw_size);
+        cache.set("a", response(raw));
+        cache.set("b", response(raw));
+        assert_eq!(cache.page_text("a", 20), Some(Some("hello".into())));
+        assert!(cache.lock().entries["a"].derived_page_text.is_some());
+        assert_eq!(cache.lock().derived_bytes, 5 + DERIVED_PAGE_TEXT_OVERHEAD);
+        cache.set("c", response(raw));
+        assert_eq!(cache.stats().entries, 3);
+        assert_eq!(cache.stats().bytes, 3 * raw_size);
+        assert!(cache.lock().entries["a"].derived_page_text.is_none());
+        assert_eq!(cache.lock().derived_bytes, 0);
+        let (body, stored) = generation(&cache, "a");
+        cache.set("d", response(raw));
+        assert_eq!(cache.page_text("a", 20), None);
+        assert!(!cache.store_page_text("a", &body, stored, 20, Some("late")));
+        assert_eq!(cache.stats().entries, 3);
+    }
+
+    #[test]
+    fn derived_text_preserves_lossy_utf8_decoding() {
+        let cache = ResponseCache::default();
+        let mut raw = response("");
+        raw.body = std::sync::Arc::new(b"<article>a\xffb</article>".to_vec());
+        cache.set("page", raw);
+        assert_eq!(cache.page_text("page", 20), Some(Some("a\u{fffd}b".into())));
+    }
+
+    #[test]
+    fn valkey_derived_lookup_falls_through_without_connecting_or_counting() {
+        let cache = Cache::valkey("redis://127.0.0.1:1/0", Duration::from_secs(60));
+        assert_eq!(cache.page_text("page", 20), None);
+        assert_eq!(cache.stats().hit, 0);
+        assert_eq!(cache.stats().miss, 0);
+        assert_eq!(cache.stats().error, 0);
+    }
 }
 
 /// A cache backend: in-process memory or an external Valkey / Redis server.
@@ -263,6 +596,15 @@ impl Cache {
         match &self.backend {
             CacheBackend::Memory(cache) => cache.get(key),
             CacheBackend::Valkey(cache) => cache.get(key).await,
+        }
+    }
+
+    /// Reuse readable text tied to an in-memory raw-response generation.
+    /// Valkey retains its existing fetch/parse behavior and wire format.
+    pub fn page_text(&self, key: &str, max_chars: usize) -> Option<Option<String>> {
+        match &self.backend {
+            CacheBackend::Memory(cache) => cache.page_text(key, max_chars),
+            CacheBackend::Valkey(_) => None,
         }
     }
 

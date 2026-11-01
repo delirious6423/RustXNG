@@ -1,0 +1,20 @@
+[
+  {
+    "filename": "rust-ownership.html",
+    "url": "https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html",
+    "bytes": 55998,
+    "sha256": "e3fc7f4e1db60f35be5bf71f915af51863b2ad0ccc5dd0e78debf4ce57e966a5"
+  },
+  {
+    "filename": "python-asyncio.html",
+    "url": "https://docs.python.org/3/library/asyncio-eventloop.html",
+    "bytes": 250263,
+    "sha256": "733c22aac8f2946a8edaf2d1ff6189197b7d825b89cf917b80810494bc0011f1"
+  },
+  {
+    "filename": "sqlite-select.html",
+    "url": "https://www.sqlite.org/lang_select.html",
+    "bytes": 2033807,
+    "sha256": "f850d5a0e9441d348535494f9c647ea90548a03a1c7bd51cdac6c7943e6dc785"
+  }
+]
