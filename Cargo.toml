@@ -49,4 +49,4 @@ db-engines = ["dep:postgres", "dep:mysql", "dep:rusqlite", "dep:mongodb", "dep:b
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
-flate2 = "1.1.10"
+flate2 = "1"

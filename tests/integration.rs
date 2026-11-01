@@ -545,3 +545,32 @@ async fn text_responses_are_compressed_and_the_style_sheet_is_cacheable() {
         assert!(text.contains("rust") || text.contains("body"), "{uri}");
     }
 }
+
+/// Pages link the style sheet by content hash, so it can be cached long
+/// without serving an old style sheet after an upgrade.
+#[tokio::test]
+async fn pages_link_the_style_sheet_by_content_hash() {
+    let base_url = start_fake_engine().await;
+    let app = app(settings_for(&base_url));
+    let href = rustxng::web::style_href();
+    assert!(href.starts_with("/static/style.css?v="));
+    for uri in [
+        "/",
+        "/search?q=rust",
+        "/about",
+        "/preferences",
+        "/stats",
+        "/nope",
+    ] {
+        let (_, body, _) = get_uri(&app, uri).await;
+        assert!(body.contains(&format!("href=\"{href}\"")), "{uri}");
+    }
+    let (status, _, headers) = get_uri(&app, &href).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("immutable")
+    );
+}

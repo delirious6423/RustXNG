@@ -955,10 +955,11 @@ pub async fn style() -> Response {
     (
         [
             (header::CONTENT_TYPE, "text/css; charset=utf-8"),
-            // Revalidating the style sheet on every page costs a round trip.
-            (header::CACHE_CONTROL, "public, max-age=86400"),
+            // Pages link it with a content hash (`style_href`), so a changed
+            // style sheet has a new URL and the old one can be cached long.
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
-        include_str!("../../static/style.css"),
+        super::STYLE_CSS,
     )
         .into_response()
 }
