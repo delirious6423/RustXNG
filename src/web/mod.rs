@@ -84,6 +84,9 @@ pub fn router(state: AppState) -> Router {
         .route("/static/style.css", get(handlers::style))
         .fallback(handlers::not_found)
         .with_state(state)
+        // Pages, JSON and CSS are text: brotli/zstd/gzip cut them several fold.
+        // Images and tiny bodies are left alone by the default predicate.
+        .layer(tower_http::compression::CompressionLayer::new())
 }
 
 /// Render a template, turning errors into a 500 response.

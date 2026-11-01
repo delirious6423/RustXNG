@@ -499,3 +499,49 @@ async fn the_search_form_offers_a_time_range() {
     assert!(body.contains("value=\"week\" selected"));
     assert!(body.contains("Past week"));
 }
+
+/// Text responses are compressed for clients that accept it, and the style
+/// sheet can be cached by the browser.
+#[tokio::test]
+async fn text_responses_are_compressed_and_the_style_sheet_is_cacheable() {
+    use std::io::Read;
+    let base_url = start_fake_engine().await;
+    let app = app(settings_for(&base_url));
+    for uri in [
+        "/static/style.css",
+        "/search?q=rust&format=json",
+        "/search?q=rust",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            response.headers()[header::CONTENT_ENCODING],
+            "gzip",
+            "{uri}"
+        );
+        if uri == "/static/style.css" {
+            assert!(
+                response.headers()[header::CACHE_CONTROL]
+                    .to_str()
+                    .unwrap()
+                    .contains("max-age=")
+            );
+        }
+        let wire = response.into_body().collect().await.unwrap().to_bytes();
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(&wire[..])
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(text.contains("rust") || text.contains("body"), "{uri}");
+    }
+}

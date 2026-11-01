@@ -429,6 +429,8 @@ dependencies = [
  "compression-core",
  "flate2",
  "memchr",
+ "zstd",
+ "zstd-safe",
 ]
 
 [[package]]
@@ -2710,6 +2712,7 @@ dependencies = [
  "base64 0.22.1",
  "bson",
  "chrono",
+ "flate2",
  "futures",
  "http-body-util",
  "mongodb",

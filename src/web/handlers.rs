@@ -953,7 +953,11 @@ pub async fn favicon() -> Response {
 /// `GET /static/style.css`.
 pub async fn style() -> Response {
     (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            // Revalidating the style sheet on every page costs a round trip.
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
         include_str!("../../static/style.css"),
     )
         .into_response()
