@@ -38,6 +38,7 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 mongodb = { version = "3", default-features = false, features = ["bson-3", "compat-3-3-0", "rustls-tls"], optional = true }
 bson = { version = "3", optional = true }
 tantivy = "0.27"
+rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-io"] }
 
 [features]
 default = ["db-engines"]
@@ -49,3 +50,4 @@ db-engines = ["dep:postgres", "dep:mysql", "dep:rusqlite", "dep:mongodb", "dep:b
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+rmcp = { version = "3.8", default-features = false, features = ["client", "server", "macros"] }

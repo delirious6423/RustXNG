@@ -92,6 +92,8 @@ Response shape (SearXNG compatible):
 
 The browser UI is at <http://127.0.0.1:8888/>.
 
+For MCP clients, `rustxng mcp` serves `search` and `read_page` tools on stdio ([docs/MCP.md](docs/MCP.md)).
+
 ## How it compares
 
 100 questions with known answer pages, measured on the same machine:
@@ -120,6 +122,7 @@ Two caveats, stated plainly: the numbers move by a few points between runs, and 
 
 | | |
 | --- | --- |
+| [docs/MCP.md](docs/MCP.md) | The built-in MCP server (`rustxng mcp`): tools, arguments, client setup |
 | [docs/AI-INFRA.md](docs/AI-INFRA.md) | Why this is agent infrastructure, and why tests and audits matter |
 | [docs/COMPARISON-EXA.md](docs/COMPARISON-EXA.md) | The comparison above, explained without jargon |
 | [docs/BENCHMARK.md](docs/BENCHMARK.md) | How the numbers were produced, including the variance |

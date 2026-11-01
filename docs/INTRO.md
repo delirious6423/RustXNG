@@ -109,7 +109,7 @@ query_str = "SELECT title, body FROM docs WHERE body LIKE '%' || $1 || '%'"
 }
 ```
 
-エンドポイントは `GET /search?q=...&format=json` だけです。MCP で使いたい場合は、この 1 本を叩く薄い MCP サーバーを被せれば動きます（組み込みの MCP サーバーはまだありません）。
+エンドポイントは `GET /search?q=...&format=json` だけです。MCP クライアントからは、組み込みの MCP サーバー `rustxng mcp`（stdio）で `search` / `read_page` ツールとして使えます（[MCP.md](MCP.md)）。
 
 ### トークンを抑える
 

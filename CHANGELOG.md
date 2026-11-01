@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **組み込みの MCP サーバー**（`rustxng mcp`、stdio）— 公式 Rust SDK `rmcp` で `search`（順位付きスニペット）と `read_page`（検索結果のページ本文を文字単位で分割して読む）を提供。HTTP API と同じ `Searcher` を共有し、任意 URL の取得はできない（#30）
+
 ## [0.26.0] - 2026-11-01
 
 導入のしやすさと発見性を整え、OSS として配布物を完成させました。

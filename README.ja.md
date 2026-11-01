@@ -186,6 +186,10 @@ curl 'http://127.0.0.1:8888/search?q=llm&format=json&max_results=5&include_domai
 curl 'http://127.0.0.1:8888/search?q=tokio&format=json&max_results=2&include_raw_content=1'
 ```
 
+### MCP サーバー
+
+MCP クライアント（Claude Desktop・Claude Code・Cursor など）からは、`rustxng mcp` を stdio のサーバーとして登録すると `search` / `read_page` ツールで使えます。詳しくは [docs/MCP.md](docs/MCP.md)。
+
 ## 対応している検索サイト
 
 SearXNG が標準で用意している **226 種類すべて**を移植済みです（352 の設定エントリ）。加えて日本語検索の **Yahoo! JAPAN** など、上流にないエンジンも追加しています。
