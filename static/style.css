@@ -61,6 +61,7 @@ ul.results > li { margin-bottom: 1.25rem; }
 footer { color: var(--muted); font-size: .8rem; border-top: 1px solid var(--border); margin-top: 2rem; padding-top: .75rem; }
 table { border-collapse: collapse; width: 100%; font-size: .9rem; }
 th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--border); }
+.pending { color: var(--muted); }
 pre.error { background: var(--card); padding: 1rem; border-radius: .5rem; overflow-x: auto; }
 
 /* Key/value rows from database backed engines */

@@ -587,6 +587,10 @@ async fn html_search_sends_the_search_form_before_the_engines_answer() {
             "{encoding}: {head}"
         );
         assert!(!head.contains("The Rust Book"), "{encoding}");
+        assert!(
+            head.contains("id=\"pending\""),
+            "{encoding}: shows that it is searching"
+        );
 
         release.notify_one();
         let rest = body.collect().await.unwrap().to_bytes();
@@ -594,6 +598,7 @@ async fn html_search_sends_the_search_form_before_the_engines_answer() {
         let page = decoded_prefix(encoding, &wire);
         assert!(page.contains("The Rust Book"), "{encoding}: {page}");
         assert!(page.trim_end().ends_with("</html>"), "{encoding}");
+        assert!(page.contains("#pending{display:none}"), "{encoding}");
     }
 }
 

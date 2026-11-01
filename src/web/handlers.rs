@@ -387,10 +387,18 @@ fn stream_results_page(
             )
             .render()
         };
-        rendered.map_err(|error| {
+        // A half page with no message is worse than a notice.
+        let rendered = rendered.or_else(|error| {
             tracing::error!(%error, "template could not be rendered");
-            std::io::Error::other(error.to_string())
-        })
+            StreamNoticeTemplate {
+                message: "The results could not be shown.".to_string(),
+                url: String::new(),
+            }
+            .render()
+        });
+        rendered
+            .map(|rest| format!("<style>#pending{{display:none}}</style>\n{rest}"))
+            .map_err(|error| std::io::Error::other(error.to_string()))
     };
     let chunks = futures::stream::once(async move { Ok::<_, std::io::Error>(head) })
         .chain(futures::stream::once(rest));
