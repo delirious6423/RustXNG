@@ -409,6 +409,61 @@ mod tests {
         assert_order(&cache, &["new".to_string()]);
     }
 
+    /// Random churn under a tight budget, with expiry and derived text,
+    /// compared against a FIFO model using the same size rule, so eviction
+    /// and expiry are exercised (the test above never evicts).
+    #[test]
+    fn linked_order_matches_queue_model_under_eviction_and_expiry() {
+        let ttl = Duration::from_secs(60);
+        let max_bytes = 4096;
+        let cache = ResponseCache::new(ttl, max_bytes);
+        let mut model = std::collections::VecDeque::<(String, usize)>::new();
+        let mut rng = 0x1234_5678_9abc_def1_u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut evictions = 0;
+        for step in 0..20_000 {
+            let key = format!("k{}", next() % 61);
+            match next() % 10 {
+                0 => {
+                    if let Some(entry) = cache.lock().entries.get_mut(key.as_str()) {
+                        entry.stored = Instant::now() - ttl - Duration::from_secs(1);
+                    }
+                    assert!(cache.get(&key).is_none());
+                    model.retain(|(k, _)| k != &key);
+                }
+                1 => {
+                    let _ = cache.page_text(&key, 1000);
+                }
+                _ => {
+                    let body_len = (next() % 700) as usize;
+                    let body = format!("<article>{}</article>", "x".repeat(body_len));
+                    let size = body.len() + key.len() + 128;
+                    cache.set(&key, response(&body));
+                    model.retain(|(k, _)| k != &key);
+                    model.push_back((key.clone(), size));
+                    let mut total: usize = model.iter().map(|(_, s)| *s).sum();
+                    while total > max_bytes {
+                        let (_, s) = model.pop_front().unwrap();
+                        total -= s;
+                        evictions += 1;
+                    }
+                }
+            }
+            let expected: Vec<String> = model.iter().map(|(k, _)| k.clone()).collect();
+            assert_order(&cache, &expected);
+            assert!(cache.lock().bytes <= max_bytes, "step {step}");
+        }
+        assert!(
+            evictions > 1000,
+            "the test must actually evict: {evictions}"
+        );
+    }
+
     fn response(body: &str) -> CachedResponse {
         CachedResponse {
             status: 200,
