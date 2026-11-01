@@ -862,13 +862,6 @@ impl Searcher {
 
     /// The readable text of one page, `None` when it cannot be fetched.
     async fn page_text(&self, url: &str) -> Option<String> {
-        self.page_text_limited(url, self.settings.search.raw_content_chars.max(1))
-            .await
-    }
-
-    /// The readable text of one page, cut after `max_chars` characters (an
-    /// ellipsis marks the cut). `None` when it cannot be fetched.
-    pub async fn page_text_limited(&self, url: &str, max_chars: usize) -> Option<String> {
         // Result URLs come from third-party engines, so treat them as untrusted:
         // an engine (or a poisoned result) must not make us fetch localhost or
         // the cloud metadata endpoint on its behalf.
@@ -884,7 +877,8 @@ impl Searcher {
             .await
             .ok()?;
         let html = response.html().ok()?;
-        let text = crate::content::main_text_limited(&html, max_chars);
+        let text =
+            crate::content::main_text_limited(&html, self.settings.search.raw_content_chars.max(1));
         if text.is_empty() { None } else { Some(text) }
     }
 

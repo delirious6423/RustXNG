@@ -8,8 +8,10 @@
 //! Two read-only tools keep the model's context small: `search` returns ranked
 //! snippets only, and `read_page` returns a bounded slice of the readable text
 //! of a page that an earlier search in the same session returned. There is no
-//! arbitrary URL fetch, and page reads go through the same public-URL guard as
-//! `include_raw_content`.
+//! arbitrary URL fetch, and pages are fetched by [`page::PageReader`], which
+//! only connects to public addresses and bounds what it downloads.
+
+pub mod page;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -130,17 +132,29 @@ pub struct McpServer {
     searcher: Arc<Searcher>,
     /// URLs returned by recent searches, oldest first.
     seen: Arc<Mutex<VecDeque<String>>>,
+    pages: page::PageReader,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl McpServer {
-    pub fn new(searcher: Arc<Searcher>) -> Self {
-        Self {
+    pub fn new(searcher: Arc<Searcher>) -> Result<Self, String> {
+        Self::with_page_overrides(searcher, &[])
+    }
+
+    /// Like [`McpServer::new`], with hostnames pinned to addresses for page
+    /// reads, bypassing the public-address check (tests serve from loopback).
+    pub fn with_page_overrides(
+        searcher: Arc<Searcher>,
+        overrides: &[(String, std::net::SocketAddr)],
+    ) -> Result<Self, String> {
+        let pages = page::PageReader::new(&searcher.settings.outgoing, overrides)?;
+        Ok(Self {
             searcher,
             seen: Arc::new(Mutex::new(VecDeque::new())),
+            pages,
             tool_router: Self::tool_router(),
-        }
+        })
     }
 
     /// Search the web through every enabled engine and return ranked snippets.
@@ -183,11 +197,9 @@ impl McpServer {
             return Err(format!("offset must be below {MAX_PAGE_CHARS}"));
         }
         let end = (offset + max_chars).min(MAX_PAGE_CHARS);
-        let text = self
-            .searcher
-            .page_text_limited(&args.url, end)
-            .await
-            .ok_or("the page could not be fetched or has no readable text")?;
+        // The whole readable text is extracted once and kept for the session,
+        // so continuing with next_offset does not fetch the page again.
+        let text = self.pages.text(&args.url, MAX_PAGE_CHARS).await?;
         let (text, next_offset) = slice_page_text(&text, offset, end)?;
         Ok(Json(ReadPageOutput {
             url: args.url,
@@ -337,7 +349,7 @@ impl ServerHandler for McpServer {
 
 /// Serve MCP over stdin/stdout until the client disconnects.
 pub async fn serve_stdio(searcher: Searcher) -> Result<(), String> {
-    let service = McpServer::new(Arc::new(searcher))
+    let service = McpServer::new(Arc::new(searcher))?
         .serve(rmcp::transport::stdio())
         .await
         .map_err(|error| format!("MCP initialisation failed: {error}"))?;
@@ -381,7 +393,7 @@ mod tests {
     use super::*;
 
     fn server(settings: crate::settings::Settings) -> McpServer {
-        McpServer::new(Arc::new(Searcher::new(settings).unwrap()))
+        McpServer::new(Arc::new(Searcher::new(settings).unwrap())).unwrap()
     }
 
     fn args(query: &str) -> SearchArgs {
