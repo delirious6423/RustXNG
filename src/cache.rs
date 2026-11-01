@@ -1,11 +1,12 @@
 //! In-memory HTTP response cache, ported from `searx/cache.py`.
 //!
 //! Upstream configuration equivalents are `cache.ttl` (default 300 s) and
-//! `cache.max_bytes` (default 8 MB); the cache is a bounded LRU with a TTL.
+//! `cache.max_bytes` (default 8 MB). Eviction preserves insertion order plus TTL;
+//! reads intentionally do not refresh order or expiry (compatibility behavior).
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,9 @@ struct Entry {
     response: CachedResponse,
     size: usize,
     derived_page_text: Option<DerivedPageText>,
+    // Links share key allocations with the map instead of copying URL strings.
+    previous: Option<Arc<str>>,
+    next: Option<Arc<str>>,
 }
 
 /// A single rendering of this exact cached body. Keeping it on the raw entry
@@ -50,13 +54,14 @@ const DERIVED_PAGE_TEXT_OVERHEAD: usize = 128;
 
 #[derive(Default)]
 struct Inner {
-    entries: HashMap<String, Entry>,
-    order: VecDeque<String>,
+    entries: HashMap<Arc<str>, Entry>,
+    oldest: Option<Arc<str>>,
+    newest: Option<Arc<str>>,
     bytes: usize,
     derived_bytes: usize,
 }
 
-/// A TTL + LRU cache for engine responses.
+/// A bounded TTL + insertion-order response cache. Key removal is expected O(1).
 pub struct ResponseCache {
     inner: Mutex<Inner>,
     ttl: Duration,
@@ -214,16 +219,29 @@ impl ResponseCache {
         let mut inner = self.lock();
         self.remove_locked(&mut inner, key);
         inner.bytes += size;
+        let owned_key: Arc<str> = Arc::from(key);
+        let previous = inner.newest.clone();
+        if let Some(tail) = &previous {
+            inner
+                .entries
+                .get_mut(tail.as_ref())
+                .expect("tail exists")
+                .next = Some(Arc::clone(&owned_key));
+        } else {
+            inner.oldest = Some(Arc::clone(&owned_key));
+        }
         inner.entries.insert(
-            key.to_string(),
+            Arc::clone(&owned_key),
             Entry {
                 stored: Instant::now(),
                 response,
                 size,
                 derived_page_text: None,
+                previous,
+                next: None,
             },
         );
-        inner.order.push_back(key.to_string());
+        inner.newest = Some(owned_key);
         self.evict_locked(&mut inner);
     }
 
@@ -233,49 +251,60 @@ impl ResponseCache {
             if let Some(derived) = entry.derived_page_text {
                 inner.derived_bytes -= derived.accounted_bytes;
             }
-            if let Some(position) = inner.order.iter().position(|candidate| candidate == key) {
-                inner.order.remove(position);
+            match &entry.previous {
+                Some(previous) => {
+                    inner
+                        .entries
+                        .get_mut(previous.as_ref())
+                        .expect("previous exists")
+                        .next = entry.next.clone();
+                }
+                None => inner.oldest = entry.next.clone(),
+            }
+            match &entry.next {
+                Some(next) => {
+                    inner
+                        .entries
+                        .get_mut(next.as_ref())
+                        .expect("next exists")
+                        .previous = entry.previous;
+                }
+                None => inner.newest = entry.previous,
             }
         }
     }
 
     fn evict_locked(&self, inner: &mut Inner) {
-        // Derived text is opportunistic. Give its space back before evicting
-        // raw responses, so memoization cannot reduce raw-body retention.
-        if inner.bytes > self.max_bytes && inner.derived_bytes > 0 {
-            for key in &inner.order {
-                if let Some(entry) = inner.entries.get_mut(key) {
-                    if let Some(derived) = entry.derived_page_text.take() {
-                        entry.size -= derived.accounted_bytes;
-                        inner.bytes -= derived.accounted_bytes;
-                        inner.derived_bytes -= derived.accounted_bytes;
-                    }
-                }
-                if inner.bytes <= self.max_bytes || inner.derived_bytes == 0 {
-                    break;
-                }
+        // Preserve the prior derived-first policy AND its insertion-order choice.
+        // This occasional derived scan remains O(n); ordinary replace/expire and
+        // raw eviction no longer linearly search and shift a VecDeque.
+        let mut cursor = inner.oldest.clone();
+        while inner.bytes > self.max_bytes && inner.derived_bytes > 0 {
+            let Some(key) = cursor else { break };
+            let entry = inner
+                .entries
+                .get_mut(key.as_ref())
+                .expect("ordered entry exists");
+            cursor = entry.next.clone();
+            if let Some(derived) = entry.derived_page_text.take() {
+                entry.size -= derived.accounted_bytes;
+                inner.bytes -= derived.accounted_bytes;
+                inner.derived_bytes -= derived.accounted_bytes;
             }
         }
         while inner.bytes > self.max_bytes {
-            let Some(key) = inner.order.pop_front() else {
+            let Some(key) = inner.oldest.clone() else {
                 break;
             };
-            if let Some(entry) = inner.entries.remove(&key) {
-                inner.bytes = inner.bytes.saturating_sub(entry.size);
-                if let Some(derived) = entry.derived_page_text {
-                    inner.derived_bytes -= derived.accounted_bytes;
-                }
-            }
+            self.remove_locked(inner, key.as_ref());
         }
     }
 
     /// Drop every entry (used by tests and `/stats`).
     pub fn clear(&self) {
         let mut inner = self.lock();
-        inner.entries.clear();
-        inner.order.clear();
-        inner.bytes = 0;
-        inner.derived_bytes = 0;
+        // Also release table capacity rather than retaining the high-water mark.
+        *inner = Inner::default();
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -293,6 +322,92 @@ impl ResponseCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_order(cache: &ResponseCache, expected: &[String]) {
+        let inner = cache.lock();
+        let mut cursor = inner.oldest.clone();
+        let mut previous: Option<Arc<str>> = None;
+        let mut actual = Vec::new();
+        while let Some(key) = cursor {
+            assert!(actual.len() < inner.entries.len(), "cycle in cache links");
+            let entry = &inner.entries[key.as_ref()];
+            assert_eq!(entry.previous, previous);
+            actual.push(key.to_string());
+            previous = Some(key);
+            cursor = entry.next.clone();
+        }
+        assert_eq!(previous, inner.newest);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), inner.entries.len());
+        assert_eq!(
+            inner.bytes,
+            inner.entries.values().map(|e| e.size).sum::<usize>()
+        );
+        assert_eq!(
+            inner.derived_bytes,
+            inner
+                .entries
+                .values()
+                .map(|e| {
+                    e.derived_page_text
+                        .as_ref()
+                        .map_or(0, |d| d.accounted_bytes)
+                })
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn linked_order_matches_independent_queue_under_random_churn() {
+        let cache = ResponseCache::new(Duration::from_secs(3600), 1 << 24);
+        let mut model = std::collections::VecDeque::<String>::new();
+        let mut rng = 0x91a5_f123_08c1_u64;
+        for step in 0..10_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let key = format!("key-{}", rng % 257);
+            if step % 7 == 0 {
+                cache.remove_locked(&mut cache.lock(), &key);
+                model.retain(|k| k != &key);
+            } else {
+                cache.set(&key, response("body"));
+                model.retain(|k| k != &key);
+                model.push_back(key.clone());
+            }
+            if step % 13 == 0 {
+                let _ = cache.get(&key); // Reads must not move insertion order.
+            }
+            assert_order(&cache, &model.iter().cloned().collect::<Vec<_>>());
+        }
+        cache.clear();
+        assert_order(&cache, &[]);
+    }
+
+    #[test]
+    fn linked_order_handles_head_tail_middle_and_singleton() {
+        let cache = ResponseCache::default();
+        for key in ["a", "b", "c", "d"] {
+            cache.set(key, response("x"));
+        }
+        for (key, expected) in [
+            ("b", vec!["a", "c", "d"]),
+            ("a", vec!["c", "d"]),
+            ("d", vec!["c"]),
+            ("c", vec![]),
+        ] {
+            cache.remove_locked(&mut cache.lock(), key);
+            assert_order(
+                &cache,
+                &expected
+                    .iter()
+                    .map(|k| (*k).to_string())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        cache.set("new", response("x"));
+        assert_order(&cache, &["new".to_string()]);
+    }
 
     fn response(body: &str) -> CachedResponse {
         CachedResponse {
