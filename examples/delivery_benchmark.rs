@@ -3,7 +3,8 @@
 //! on screen, time until the full page, and bytes on the wire.
 //!
 //! cargo run --release --no-default-features --example delivery_benchmark --
-//!     --iterations 30 [--engines 8] [--slowest-ms 400]
+//!     --iterations 30 [--engines 8] [--slowest-ms 400] [--results 10]
+//!     [--accept-encoding "gzip, deflate"]
 //!
 //! A loopback upstream answers each fake JSON engine after a fixed delay
 //! (spread evenly up to --slowest-ms, like a warm search where the slowest
@@ -22,13 +23,14 @@ use rustxng::aggregator::Searcher;
 use rustxng::settings::{EngineConfig, LimiterSettings, Settings};
 use rustxng::web::{AppState, router};
 
-const ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+const BROWSER_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 
 #[derive(serde::Deserialize)]
 struct UpstreamParams {
     q: String,
     e: usize,
     delay: u64,
+    n: usize,
 }
 
 const WORDS: &[&str] = &[
@@ -172,7 +174,7 @@ async fn upstream(Query(params): Query<UpstreamParams>) -> axum::Json<Value> {
     let mut seed = params.q.bytes().fold(params.e as u64 + 1, |hash, byte| {
         hash.wrapping_mul(31).wrapping_add(byte as u64)
     });
-    let results: Vec<Value> = (0..10)
+    let results: Vec<Value> = (0..params.n)
         .map(|_| {
             let host = words(&mut seed, 1);
             let path = words(&mut seed, 3).replace(' ', "-");
@@ -221,11 +223,17 @@ fn decoded_prefix(encoding: &str, wire: &[u8]) -> Vec<u8> {
     out
 }
 
-async fn fetch(client: &reqwest::Client, url: &str, marker: Option<&[u8]>) -> Sample {
+struct Client {
+    http: reqwest::Client,
+    accept_encoding: String,
+}
+
+async fn fetch(client: &Client, url: &str, marker: Option<&[u8]>) -> Sample {
     let started = Instant::now();
     let mut response = client
+        .http
         .get(url)
-        .header("Accept-Encoding", ACCEPT_ENCODING)
+        .header("Accept-Encoding", &client.accept_encoding)
         .header("Accept", "text/html,application/json,*/*")
         .send()
         .await
@@ -305,14 +313,25 @@ async fn main() {
     let mut iterations = 30usize;
     let mut engines = 8usize;
     let mut slowest_ms = 400u64;
+    let mut results = 10usize;
+    let mut accept_encoding = BROWSER_ACCEPT_ENCODING.to_string();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        let mut value = || args.next().expect("value").parse::<u64>().expect("number");
         match arg.as_str() {
-            "--iterations" => iterations = value() as usize,
-            "--engines" => engines = value() as usize,
-            "--slowest-ms" => slowest_ms = value(),
-            _ => panic!("use --iterations N --engines N --slowest-ms MS"),
+            "--accept-encoding" => accept_encoding = args.next().expect("encodings"),
+            _ => {
+                let value: u64 = args.next().expect("value").parse().expect("number");
+                match arg.as_str() {
+                    "--iterations" => iterations = value as usize,
+                    "--engines" => engines = value as usize,
+                    "--slowest-ms" => slowest_ms = value,
+                    "--results" => results = value as usize,
+                    _ => panic!(
+                        "use --iterations N --engines N --slowest-ms MS --results N \
+                         --accept-encoding LIST"
+                    ),
+                }
+            }
         }
     }
 
@@ -338,7 +357,7 @@ async fn main() {
                 &["general"],
             );
             config.search_url = Some(format!(
-                "http://{upstream_address}/search?q={{query}}&e={index}&delay={delay}"
+                "http://{upstream_address}/search?q={{query}}&e={index}&delay={delay}&n={results}"
             ));
             for (key, value) in [
                 ("results_query", "results"),
@@ -371,12 +390,15 @@ async fn main() {
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let client = reqwest::Client::builder()
-        .no_gzip()
-        .no_brotli()
-        .no_deflate()
-        .build()
-        .unwrap();
+    let client = Client {
+        http: reqwest::Client::builder()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .build()
+            .unwrap(),
+        accept_encoding: accept_encoding.clone(),
+    };
     let mut html = Vec::new();
     let mut json_samples = Vec::new();
     let mut css = Vec::new();
@@ -401,7 +423,8 @@ async fn main() {
         "iterations": iterations,
         "engines": engines,
         "slowest_engine_ms": slowest_ms,
-        "accept_encoding": ACCEPT_ENCODING,
+        "results_per_engine": results,
+        "accept_encoding": accept_encoding,
         "html_search": summary(&html),
         "json_search": summary(&json_samples),
         "style_css": summary(&css),

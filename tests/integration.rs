@@ -500,58 +500,101 @@ async fn the_search_form_offers_a_time_range() {
     assert!(body.contains("Past week"));
 }
 
+/// Decode what has arrived so far of a possibly unfinished compressed body.
+fn decoded_prefix(encoding: &str, wire: &[u8]) -> String {
+    use std::io::Read;
+    let mut out = Vec::new();
+    match encoding {
+        "gzip" => {
+            let _ = flate2::read::GzDecoder::new(wire).read_to_end(&mut out);
+        }
+        "br" => {
+            let _ = brotli::Decompressor::new(wire, 4096).read_to_end(&mut out);
+        }
+        "zstd" => {
+            if let Ok(mut decoder) = zstd::stream::read::Decoder::new(wire) {
+                let _ = decoder.read_to_end(&mut out);
+            }
+        }
+        _ => out.extend_from_slice(wire),
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 /// The page head and search form are sent while the engines are still
-/// running, so the browser paints the page instead of waiting for them.
+/// running, so the browser paints the page instead of waiting for them. This
+/// holds for every encoding a browser may negotiate: a compressor that
+/// buffered the head until the end would defeat the streaming.
 #[tokio::test]
 async fn html_search_sends_the_search_form_before_the_engines_answer() {
-    let release = Arc::new(tokio::sync::Notify::new());
-    let gate = release.clone();
-    let engine = Router::new().route(
-        "/api/v1/search/",
-        get(move || {
-            let gate = gate.clone();
-            async move {
-                gate.notified().await;
-                ([(header::CONTENT_TYPE, "application/json")], MWMBL_RESPONSE)
+    for encoding in ["identity", "gzip", "br", "zstd"] {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gate = release.clone();
+        let engine = Router::new().route(
+            "/api/v1/search/",
+            get(move || {
+                let gate = gate.clone();
+                async move {
+                    gate.notified().await;
+                    ([(header::CONTENT_TYPE, "application/json")], MWMBL_RESPONSE)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
+        let mut settings = settings_for(&format!("http://{address}/api/v1"));
+        settings.search.timeout_limit = 5.0;
+        settings.engines[0].timeout = Some(5.0);
+        let app = app(settings);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/search?q=rust")
+                    .header(header::ACCEPT_ENCODING, encoding)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_encoding = response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .map(|value| value.to_str().unwrap().to_string())
+            .unwrap_or_else(|| "identity".into());
+        assert_eq!(content_encoding, encoding);
+        let mut body = response.into_body();
+        let mut wire = Vec::new();
+        // Read frames until the form is decodable, while the engine is held back.
+        let head = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let frame = body.frame().await.unwrap().unwrap();
+                if let Ok(data) = frame.into_data() {
+                    wire.extend_from_slice(&data);
+                }
+                let decoded = decoded_prefix(encoding, &wire);
+                if decoded.contains("</form>") {
+                    return decoded;
+                }
             }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
-    let mut settings = settings_for(&format!("http://{address}/api/v1"));
-    settings.search.timeout_limit = 5.0;
-    settings.engines[0].timeout = Some(5.0);
-    let app = app(settings);
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/search?q=rust")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        })
         .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let mut body = response.into_body();
-    let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
-        .await
-        .expect("the head is sent before the engine answers")
-        .unwrap()
-        .unwrap()
-        .into_data()
-        .unwrap();
-    let head = String::from_utf8_lossy(&first).to_string();
-    assert!(head.contains("name=\"q\" value=\"rust\""), "{head}");
-    assert!(head.contains("</form>"));
-    assert!(!head.contains("The Rust Book"));
+        .unwrap_or_else(|_| panic!("{encoding}: the form must arrive before the engine answers"));
+        assert!(
+            head.contains("name=\"q\" value=\"rust\""),
+            "{encoding}: {head}"
+        );
+        assert!(!head.contains("The Rust Book"), "{encoding}");
 
-    release.notify_one();
-    let rest = body.collect().await.unwrap().to_bytes();
-    let rest = String::from_utf8_lossy(&rest);
-    assert!(rest.contains("The Rust Book"), "{rest}");
-    assert!(rest.trim_end().ends_with("</html>"));
+        release.notify_one();
+        let rest = body.collect().await.unwrap().to_bytes();
+        wire.extend_from_slice(&rest);
+        let page = decoded_prefix(encoding, &wire);
+        assert!(page.contains("The Rust Book"), "{encoding}: {page}");
+        assert!(page.trim_end().ends_with("</html>"), "{encoding}");
+    }
 }
 
 /// Text responses are compressed for clients that accept it, and the style
