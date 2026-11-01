@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::cache::Cache;
 use crate::engine::util::{json_str, locale_language};
 use crate::engine::{EngineRequest, EngineResponse};
 use crate::network::Network;
@@ -11,8 +12,12 @@ use crate::settings::Settings;
 pub static BACKENDS: &[&str] = &["duckduckgo", "google", "wikipedia", "mwmbl"];
 
 /// Fetch suggestions for `query` from `backend`.
+///
+/// Every keystroke asks for a prefix; with the response cache, a prefix seen
+/// before (typing it again, backspacing) is answered without a round trip.
 pub async fn suggest(
     network: &Network,
+    cache: Option<&Cache>,
     settings: &Settings,
     backend: &str,
     query: &str,
@@ -60,7 +65,7 @@ pub async fn suggest(
     let _ = is_json;
     let request = EngineRequest::get(url).header("Accept", "application/json");
     let timeout = std::time::Duration::from_secs_f64(settings.search.timeout_limit.clamp(1.0, 3.0));
-    match network.fetch(request, timeout, None, None).await {
+    match network.fetch(request, timeout, cache, None).await {
         Ok(response) => parse_suggestions(backend, &response),
         Err(error) => {
             tracing::debug!(backend, %error, "autocomplete backend failed");
@@ -132,6 +137,44 @@ mod tests {
 
     fn response(body: &str) -> EngineResponse {
         EngineResponse::new(200, "https://example.com/", body.as_bytes().to_vec())
+    }
+
+    /// A cached backend answer is served without touching the network (the
+    /// proxy below is unreachable, so a network request would return nothing).
+    #[tokio::test]
+    async fn cached_suggestions_skip_the_network() {
+        let mut settings = Settings::defaults();
+        settings
+            .outgoing
+            .proxies
+            .insert("all".into(), "http://127.0.0.1:9".into());
+        let network = Network::from_settings(&settings).unwrap();
+        let cache = Cache::default();
+        let url = "https://duckduckgo.com/ac/?type=list&q=rust";
+        cache
+            .set(
+                &Cache::key("GET", url, ""),
+                crate::cache::CachedResponse {
+                    status: 200,
+                    final_url: url.into(),
+                    headers: Default::default(),
+                    body: std::sync::Arc::new(br#"["rust",["rust","rust book"]]"#.to_vec()),
+                },
+            )
+            .await;
+        let suggestions = suggest(
+            &network,
+            Some(&cache),
+            &settings,
+            "duckduckgo",
+            "rust",
+            "en",
+        )
+        .await;
+        assert_eq!(
+            suggestions,
+            vec!["rust".to_string(), "rust book".to_string()]
+        );
     }
 
     #[test]

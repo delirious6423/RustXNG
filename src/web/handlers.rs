@@ -455,6 +455,7 @@ pub async fn autocompleter(
         }
         suggestions = crate::autocomplete::suggest(
             &state.searcher.network,
+            Some(&state.searcher.cache),
             state.settings(),
             candidate,
             &query,
