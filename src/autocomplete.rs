@@ -11,10 +11,17 @@ use crate::settings::Settings;
 /// Autocomplete backends, in the order they are tried.
 pub static BACKENDS: &[&str] = &["duckduckgo", "google", "wikipedia", "mwmbl"];
 
+/// The cache for suggestions: the in-process cache only. Every prefix a
+/// visitor types would otherwise be written to an external Valkey server.
+fn suggestion_cache(cache: Option<&Cache>) -> Option<&Cache> {
+    cache.filter(|cache| !cache.is_valkey())
+}
+
 /// Fetch suggestions for `query` from `backend`.
 ///
-/// Every keystroke asks for a prefix; with the response cache, a prefix seen
-/// before (typing it again, backspacing) is answered without a round trip.
+/// Every keystroke asks for a prefix; with the in-process response cache, a
+/// prefix seen before (typing it again, backspacing) is answered without a
+/// round trip.
 pub async fn suggest(
     network: &Network,
     cache: Option<&Cache>,
@@ -65,7 +72,10 @@ pub async fn suggest(
     let _ = is_json;
     let request = EngineRequest::get(url).header("Accept", "application/json");
     let timeout = std::time::Duration::from_secs_f64(settings.search.timeout_limit.clamp(1.0, 3.0));
-    match network.fetch(request, timeout, cache, None).await {
+    match network
+        .fetch(request, timeout, suggestion_cache(cache), None)
+        .await
+    {
         Ok(response) => parse_suggestions(backend, &response),
         Err(error) => {
             tracing::debug!(backend, %error, "autocomplete backend failed");
@@ -175,6 +185,15 @@ mod tests {
             suggestions,
             vec!["rust".to_string(), "rust book".to_string()]
         );
+    }
+
+    #[test]
+    fn suggestions_are_not_written_to_valkey() {
+        let memory = Cache::default();
+        assert!(suggestion_cache(Some(&memory)).is_some());
+        let valkey = Cache::valkey("redis://127.0.0.1:9", std::time::Duration::from_secs(60));
+        assert!(suggestion_cache(Some(&valkey)).is_none());
+        assert!(suggestion_cache(None).is_none());
     }
 
     #[test]
