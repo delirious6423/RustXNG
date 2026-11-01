@@ -271,13 +271,28 @@ impl InfoboxView {
     }
 }
 
-/// The result page.
+/// The top of the result page: everything up to and including the search
+/// form. It depends only on the request, so it is sent before the engines
+/// answer and the browser can paint the page and load the style sheet.
 #[derive(Debug, Template)]
-#[template(path = "results.html")]
-pub struct ResultsTemplate {
+#[template(path = "results_head.html")]
+pub struct ResultsHeadTemplate {
+    pub instance_name: String,
+    pub query: String,
+    pub categories: Vec<CategoryView>,
+    pub method: String,
+    pub autocomplete: String,
+    pub autocomplete_min: usize,
+    pub time_range: String,
+    pub time_ranges: Vec<(String, String)>,
+}
+
+/// The rest of the result page, rendered once the search finished.
+#[derive(Debug, Template)]
+#[template(path = "results_body.html")]
+pub struct ResultsBodyTemplate {
     pub instance_name: String,
     pub version: String,
-    pub query: String,
     pub results: Vec<ResultView>,
     pub answers: Vec<String>,
     pub corrections: Vec<String>,
@@ -299,13 +314,6 @@ pub struct ResultsTemplate {
     pub has_engine_data: bool,
     pub has_timings: bool,
     pub has_results: bool,
-    pub categories: Vec<CategoryView>,
-    pub engines: Vec<EngineView>,
-    pub method: String,
-    pub autocomplete: String,
-    pub autocomplete_min: usize,
-    pub time_range: String,
-    pub time_ranges: Vec<(String, String)>,
     pub timings: Vec<(String, String)>,
     pub engine_data: Vec<(String, Vec<(String, String)>)>,
 }

@@ -11,7 +11,8 @@ use super::limiter::{ClientAddr, LimiterVerdict};
 use super::preferences::{Preferences, join_list, split_list};
 use super::{
     AboutTemplate, AppState, ErrorTemplate, IndexTemplate, PreferencesTemplate, ResultView,
-    ResultsTemplate, StatsTemplate, category_views, engine_views, render, with_cookies,
+    ResultsBodyTemplate, ResultsHeadTemplate, StatsTemplate, category_views, engine_views, render,
+    with_cookies,
 };
 use crate::aggregator::{SearchRequest, SearchResponse};
 use crate::engine::util::encode;
@@ -241,6 +242,17 @@ async fn run_search(
         },
     };
 
+    // An HTML search that will neither redirect nor fail up front streams:
+    // the head and search form go out at once, the results when the engines
+    // have answered. Everything else keeps a single, complete response.
+    if format == "html"
+        && request.query.external_bang.is_none()
+        && !request.query.redirect_to_first_result
+        && !searcher.select_engines(&request).is_empty()
+    {
+        return stream_results_page(state, preferences, params, categories, engines, request);
+    }
+
     let response = searcher.search(request).await;
     if let Some(error) = &response.error {
         return error_page(&state, StatusCode::BAD_REQUEST, error);
@@ -283,6 +295,143 @@ fn results_page(
     categories: &[String],
     engines: &[String],
 ) -> Response {
+    use askama::Template;
+    let head = results_head(
+        state,
+        preferences,
+        &response.search_query,
+        params,
+        categories,
+    );
+    let body = results_body(state, preferences, response, params, categories, engines);
+    match (head.render(), body.render()) {
+        (Ok(mut page), Ok(rest)) => {
+            page.push_str(&rest);
+            axum::response::Html(page).into_response()
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::error!(%error, "template could not be rendered");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("template error: {error}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// A notice that ends a streamed page whose search could not be shown.
+#[derive(askama::Template)]
+#[template(
+    source = "<p class=\"error\">{{ message }}{% if !url.is_empty() %} <a href=\"{{ url }}\">{{ url }}</a>{% endif %}</p>\n</body>\n</html>\n",
+    ext = "html"
+)]
+struct StreamNoticeTemplate {
+    message: String,
+    url: String,
+}
+
+/// Send the page head now and the results once the search finished.
+fn stream_results_page(
+    state: AppState,
+    preferences: Preferences,
+    params: SearchParams,
+    categories: Vec<String>,
+    engines: Vec<String>,
+    request: SearchRequest,
+) -> Response {
+    use askama::Template;
+    use futures::StreamExt;
+    let head = results_head(
+        &state,
+        &preferences,
+        &request.query.query_text(),
+        &params,
+        &categories,
+    );
+    let head = match head.render() {
+        Ok(head) => head,
+        Err(error) => {
+            tracing::error!(%error, "template could not be rendered");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("template error: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let rest = async move {
+        let response = state.searcher.search(request).await;
+        // The checks before streaming make these unlikely; the status is
+        // already sent, so they end the page instead.
+        let rendered = if let Some(error) = response.error.clone() {
+            StreamNoticeTemplate {
+                message: error,
+                url: String::new(),
+            }
+            .render()
+        } else if let Some(url) = response.redirect_url.clone() {
+            StreamNoticeTemplate {
+                message: "Continue to".to_string(),
+                url,
+            }
+            .render()
+        } else {
+            results_body(
+                &state,
+                &preferences,
+                &response,
+                &params,
+                &categories,
+                &engines,
+            )
+            .render()
+        };
+        rendered.map_err(|error| {
+            tracing::error!(%error, "template could not be rendered");
+            std::io::Error::other(error.to_string())
+        })
+    };
+    let chunks = futures::stream::once(async move { Ok::<_, std::io::Error>(head) })
+        .chain(futures::stream::once(rest));
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // Reverse proxies such as nginx would otherwise hold the head back.
+            (header::HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        axum::body::Body::from_stream(chunks),
+    )
+        .into_response()
+}
+
+fn results_head(
+    state: &AppState,
+    preferences: &Preferences,
+    query: &str,
+    params: &SearchParams,
+    categories: &[String],
+) -> ResultsHeadTemplate {
+    ResultsHeadTemplate {
+        instance_name: state.settings().general.instance_name.clone(),
+        query: query.to_string(),
+        categories: category_views(&state.searcher, categories),
+        method: preferences.method.clone(),
+        autocomplete: preferences.autocomplete.clone(),
+        autocomplete_min: state.settings().search.autocomplete_min,
+        time_range: params.time_range.clone().unwrap_or_default(),
+        time_ranges: super::time_range_options(),
+    }
+}
+
+fn results_body(
+    state: &AppState,
+    preferences: &Preferences,
+    response: &SearchResponse,
+    params: &SearchParams,
+    categories: &[String],
+    engines: &[String],
+) -> ResultsBodyTemplate {
     let base = state.base_url();
     let query = response.query.clone();
     let category = categories.join(",");
@@ -378,10 +527,9 @@ fn results_page(
         })
         .collect();
 
-    render(ResultsTemplate {
+    ResultsBodyTemplate {
         instance_name: state.settings().general.instance_name.clone(),
         version: VERSION.to_string(),
-        query: response.search_query.clone(),
         has_results: !results.is_empty(),
         results,
         has_answers: !response.answers.is_empty(),
@@ -401,18 +549,11 @@ fn results_page(
         prev_url: prev_url.unwrap_or_default(),
         next_url: next_url.unwrap_or_default(),
         engine_count: state.searcher.registry.len(),
-        categories: category_views(&state.searcher, categories),
-        engines: engine_views(&state.searcher),
-        method: preferences.method.clone(),
-        autocomplete: preferences.autocomplete.clone(),
-        autocomplete_min: state.settings().search.autocomplete_min,
-        time_range: params.time_range.clone().unwrap_or_default(),
-        time_ranges: super::time_range_options(),
         has_timings: !timings.is_empty(),
         timings,
         has_engine_data: !engine_data.is_empty(),
         engine_data,
-    })
+    }
 }
 
 /// `GET /autocompleter`.

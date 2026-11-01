@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ query }} — {{ instance_name }}</title>
+<link rel="stylesheet" href="{{ crate::web::style_href() }}">
+<link rel="search" type="application/opensearchdescription+xml" href="/opensearch.xml" title="{{ instance_name }}">
+</head>
+<body>
+<header>
+  <h1><a href="/">{{ instance_name }}</a></h1>
+  <nav>
+    <a href="/preferences">Preferences</a>
+    <a href="/about">About</a>
+    <a href="/stats">Stats</a>
+  </nav>
+</header>
+{% include "search_form.html" %}
+{% include "autocomplete.html" %}

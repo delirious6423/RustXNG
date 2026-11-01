@@ -50,3 +50,5 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 flate2 = "1"
+brotli = "9"
+zstd = "0.14"
